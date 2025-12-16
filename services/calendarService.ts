@@ -1,12 +1,15 @@
 import { TimeSlot } from '../types';
 
-// Scopes required for the application
-const SCOPES = 'https://www.googleapis.com/auth/calendar.events.readonly';
+// Scopes required for the application: Calendar Read + Cloud Storage Read/Write
+const SCOPES = 'https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/devstorage.read_write';
 const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest';
 
 let tokenClient: any;
 let gapiInited = false;
 let gisInited = false;
+let accessToken: string | null = null;
+
+export const getAccessToken = () => accessToken;
 
 /**
  * Initialize the gapi client
@@ -58,6 +61,7 @@ export const authenticateGoogle = async (clientId: string): Promise<boolean> => 
                 if (resp.error !== undefined) {
                     reject(resp);
                 }
+                accessToken = resp.access_token;
                 resolve(true);
             };
 

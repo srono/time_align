@@ -1,10 +1,10 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { useNavigate, useParams } from 'react-router-dom';
 import { CreatePollDraft, TimeSlot } from '../types';
 import { generateSlotsFromNaturalLanguage } from '../services/geminiService';
-import { savePoll, getPollById } from '../services/storageService';
-import { authenticateGoogle, fetchCalendarEvents } from '../services/calendarService';
+import { savePoll, fetchPoll } from '../services/storageService';
+import { authenticateGoogle, fetchCalendarEvents, getAccessToken } from '../services/calendarService';
 import Button from './Button';
 
 const CreatePoll: React.FC = () => {
@@ -13,61 +13,60 @@ const CreatePoll: React.FC = () => {
   const isEditing = Boolean(id);
 
   const [step, setStep] = useState(1);
+  const [loading, setLoading] = useState(false);
   
-  // Initialize draft from existing poll if editing, otherwise empty
-  const [draft, setDraft] = useState<CreatePollDraft>(() => {
-    if (id) {
-        const existing = getPollById(id);
-        if (existing) {
-            return {
-                title: existing.title,
-                description: existing.description,
-                location: existing.location || '',
-                creatorName: existing.creatorName,
-                slots: existing.slots
-            };
-        }
-    }
-    return {
-        title: '',
-        description: '',
-        location: '',
-        creatorName: '',
-        slots: []
-    };
+  // Storage Config
+  const [bucketName, setBucketName] = useState(() => localStorage.getItem('gcs_bucket_name') || '');
+  const [clientId, setClientId] = useState(() => localStorage.getItem('google_client_id') || '');
+  
+  const [draft, setDraft] = useState<CreatePollDraft>({
+    title: '',
+    description: '',
+    location: '',
+    creatorName: '',
+    slots: []
   });
   
   const [duration, setDuration] = useState<number>(60);
-  
-  // Initialize weekStart to today or the week of the first slot if editing
-  const [weekStart, setWeekStart] = useState<Date>(() => {
-    let d = new Date();
-    
-    if (id) {
-        const existing = getPollById(id);
-        if (existing && existing.slots.length > 0) {
-            // Find earliest slot to focus calendar
-            const earliest = existing.slots.reduce((min, s) => s.startTime < min ? s.startTime : min, existing.slots[0].startTime);
-            d = new Date(earliest);
-        }
-    }
+  const [weekStart, setWeekStart] = useState<Date>(new Date());
 
-    d.setHours(0,0,0,0);
-    // Align to nearest past Monday or Today
-    const day = d.getDay();
-    const diff = d.getDate() - day + (day === 0 ? -6 : 1); // adjust when day is sunday
-    return new Date(d.setDate(diff));
-  });
+  // Load existing poll if editing
+  useEffect(() => {
+    const loadPoll = async () => {
+        if (id && bucketName && getAccessToken()) {
+            setLoading(true);
+            const data = await fetchPoll(id, bucketName);
+            if (data) {
+                const { poll } = data;
+                setDraft({
+                    title: poll.title,
+                    description: poll.description,
+                    location: poll.location || '',
+                    creatorName: poll.creatorName,
+                    slots: poll.slots
+                });
+                
+                if (poll.slots.length > 0) {
+                     const earliest = poll.slots.reduce((min, s) => s.startTime < min ? s.startTime : min, poll.slots[0].startTime);
+                     const d = new Date(earliest);
+                     d.setHours(0,0,0,0);
+                     const day = d.getDay();
+                     const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+                     setWeekStart(new Date(d.setDate(diff)));
+                }
+            }
+            setLoading(false);
+        }
+    };
+    loadPoll();
+  }, [id, bucketName]); // Trigger when bucket is set/auth is ready
 
   // AI & Calendar State
   const [aiPrompt, setAiPrompt] = useState('');
   const [isAiLoading, setIsAiLoading] = useState(false);
-  
-  // Calendar Connection State
   const [isCalendarConnected, setIsCalendarConnected] = useState(false);
   const [busySlots, setBusySlots] = useState<TimeSlot[]>([]);
   const [showCalendarConfig, setShowCalendarConfig] = useState(false);
-  const [clientId, setClientId] = useState(() => localStorage.getItem('google_client_id') || '');
   const [isConnecting, setIsConnecting] = useState(false);
 
   // Handlers
@@ -97,43 +96,14 @@ const CreatePoll: React.FC = () => {
     }
   };
 
-  // Logic to simulate busy slots if no real connection
-  const generateBusySlots = (startDate: Date) => {
-    const busy: TimeSlot[] = [];
-    const daysToCheck = 14; 
-    for (let i = 0; i < daysToCheck; i++) {
-        const d = new Date(startDate);
-        d.setDate(d.getDate() + i);
-        const numMeetings = Math.floor(Math.random() * 4);
-        for (let j = 0; j < numMeetings; j++) {
-            const startHour = 9 + Math.floor(Math.random() * 8); 
-            const meetingStart = new Date(d);
-            meetingStart.setHours(startHour, Math.random() > 0.5 ? 0 : 30, 0, 0);
-            const durationMins = Math.random() > 0.7 ? 90 : 60;
-            const meetingEnd = new Date(meetingStart.getTime() + durationMins * 60000);
-            busy.push({
-                id: `busy-${i}-${j}`,
-                startTime: meetingStart.toISOString(),
-                endTime: meetingEnd.toISOString()
-            });
-        }
-    }
-    return busy;
-  };
-
-  const handleSimulate = () => {
-      const busy = generateBusySlots(weekStart);
-      setBusySlots(busy);
-      setIsCalendarConnected(true);
-      setShowCalendarConfig(false);
-  };
-
   const handleRealConnect = async () => {
-      if (!clientId) {
-          alert("Please enter a Client ID");
+      if (!clientId || !bucketName) {
+          alert("Please enter both Client ID and Bucket Name");
           return;
       }
       localStorage.setItem('google_client_id', clientId);
+      localStorage.setItem('gcs_bucket_name', bucketName);
+      
       setIsConnecting(true);
       try {
           await authenticateGoogle(clientId);
@@ -147,45 +117,68 @@ const CreatePoll: React.FC = () => {
           setBusySlots(events);
           setIsCalendarConnected(true);
           setShowCalendarConfig(false);
+          
+          // If editing, re-trigger load now that we have auth
+          if (isEditing && id) {
+              // The useEffect will catch the token change if we were tracking it, 
+              // but we might need to manually trigger if it doesn't.
+              // For now, reloading page or effect dependency handles it.
+          }
+
       } catch (error) {
           console.error(error);
-          alert("Failed to connect. Check your Client ID and allowed origins in Google Cloud Console.");
+          alert("Failed to connect. Ensure your Client ID is correct and your Bucket supports CORS.");
       } finally {
           setIsConnecting(false);
       }
   };
 
-  const handleFinish = () => {
+  const handleFinish = async () => {
     if (draft.slots.length === 0) {
       alert("Please add at least one time slot.");
       return;
     }
 
-    if (isEditing && id) {
-        const existing = getPollById(id);
-        if (existing) {
-            const updatedPoll = {
-                ...existing,
-                ...draft,
-                // slots are overwritten by draft slots.
-                // NOTE: Existing votes for removed slots will essentially become orphaned or irrelevant, 
-                // but votes for preserved slot IDs will remain valid.
-            };
-            savePoll(updatedPoll);
-            navigate(`/poll/${id}`);
-            return;
-        }
+    if (!getAccessToken()) {
+        setShowCalendarConfig(true);
+        alert("You must connect your Google Account to save to Cloud Storage.");
+        return;
     }
 
-    const newPollId = uuidv4();
-    const newPoll = {
-      ...draft,
-      id: newPollId,
-      createdAt: new Date().toISOString(),
-      participants: []
-    };
-    savePoll(newPoll);
-    navigate(`/poll/${newPollId}`);
+    setLoading(true);
+    try {
+        let pollId = id;
+        let createdAt = new Date().toISOString();
+        let participants = [];
+
+        if (isEditing && id) {
+             const data = await fetchPoll(id, bucketName);
+             if (data) {
+                createdAt = data.poll.createdAt;
+                participants = data.poll.participants;
+             }
+        } else {
+            pollId = uuidv4();
+        }
+
+        if (!pollId) return; // Should not happen
+
+        const finalPoll = {
+            ...draft,
+            id: pollId,
+            createdAt,
+            participants
+        };
+
+        await savePoll(finalPoll, bucketName);
+        // Include bucket in the URL so voters know where to look
+        navigate(`/poll/${pollId}?bucket=${bucketName}`);
+    } catch (err) {
+        console.error(err);
+        alert("Failed to save poll. Check console for details.");
+    } finally {
+        setLoading(false);
+    }
   };
 
   const removeSlot = (id: string) => {
@@ -365,15 +358,13 @@ const CreatePoll: React.FC = () => {
             <div className="flex gap-2 w-full md:w-auto">
                  {!isCalendarConnected ? (
                     <Button variant="outline" onClick={() => setShowCalendarConfig(true)} className="text-sm whitespace-nowrap">
-                        <i className="fab fa-google"></i> Connect Calendar
+                        <i className="fab fa-google"></i> Connect Calendar / Storage
                     </Button>
                  ) : (
                     <div className="flex items-center gap-2 text-xs font-medium text-gray-500 px-3 py-2 bg-gray-50 rounded-lg border">
-                        <span className="w-3 h-3 bg-gray-300 rounded-sm"></span> Busy
+                        <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span> Connected
+                        <span className="w-3 h-3 bg-gray-300 rounded-sm ml-2"></span> Busy
                         <span className="w-3 h-3 bg-brand-500 rounded-sm ml-2"></span> Selected
-                        <button onClick={() => { setIsCalendarConnected(false); setBusySlots([]); }} className="ml-2 text-gray-400 hover:text-red-500">
-                            <i className="fas fa-times"></i>
-                        </button>
                     </div>
                  )}
             </div>
@@ -456,8 +447,6 @@ const CreatePoll: React.FC = () => {
                                        viewStart.setHours(START_HOUR, 0, 0, 0);
                                        const viewEnd = new Date(dayDate);
                                        viewEnd.setHours(END_HOUR, 0, 0, 0);
-                                       
-                                       // Overlap logic: Start < EndB && End > StartB
                                        return s < viewEnd && e > viewStart;
                                     })
                                     .map(slot => (
@@ -514,6 +503,7 @@ const CreatePoll: React.FC = () => {
                 <Button 
                     onClick={handleFinish}
                     disabled={draft.slots.length === 0}
+                    isLoading={loading}
                 >
                     {isEditing ? 'Save Changes ' : 'Create Poll '} <i className="fas fa-check"></i>
                 </Button>
@@ -524,25 +514,36 @@ const CreatePoll: React.FC = () => {
       {showCalendarConfig && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-white/90 backdrop-blur-sm rounded-lg">
              <div className="bg-white p-6 rounded-xl shadow-2xl border max-w-md w-full animate-fade-in-up">
-                 <h3 className="text-lg font-bold text-gray-900 mb-2">Connect Google Calendar</h3>
+                 <h3 className="text-lg font-bold text-gray-900 mb-2">Connect Google & Storage</h3>
                  <p className="text-sm text-gray-600 mb-4">
-                     To connect your real calendar, you need a Google Cloud Client ID enabled for this origin.
+                     Enable Google Calendar and Cloud Storage to save your poll.
                  </p>
-                 <div className="mb-4">
-                     <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Client ID</label>
-                     <input 
-                        value={clientId}
-                        onChange={(e) => setClientId(e.target.value)}
-                        placeholder="71239...apps.googleusercontent.com"
-                        className="w-full text-sm p-2 border rounded focus:ring-2 focus:ring-brand-500 outline-none"
-                     />
-                     <p className="text-xs text-gray-400 mt-1">
-                         Don't have one? <a href="#" onClick={(e) => {e.preventDefault(); handleSimulate()}} className="text-brand-600 underline">Use simulation mode</a>.
-                     </p>
+                 <div className="mb-4 space-y-3">
+                     <div>
+                        <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Client ID</label>
+                        <input 
+                            value={clientId}
+                            onChange={(e) => setClientId(e.target.value)}
+                            placeholder="71239...apps.googleusercontent.com"
+                            className="w-full text-sm p-2 border rounded focus:ring-2 focus:ring-brand-500 outline-none"
+                        />
+                     </div>
+                     <div>
+                        <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">GCS Bucket Name</label>
+                        <input 
+                            value={bucketName}
+                            onChange={(e) => setBucketName(e.target.value)}
+                            placeholder="my-poll-app-storage"
+                            className="w-full text-sm p-2 border rounded focus:ring-2 focus:ring-brand-500 outline-none"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">
+                            Bucket must be CORS enabled.
+                        </p>
+                     </div>
                  </div>
                  <div className="flex justify-end gap-2">
                      <Button variant="secondary" onClick={() => setShowCalendarConfig(false)}>Cancel</Button>
-                     <Button onClick={handleRealConnect} isLoading={isConnecting} disabled={!clientId}>
+                     <Button onClick={handleRealConnect} isLoading={isConnecting} disabled={!clientId || !bucketName}>
                         Connect & Authorize
                      </Button>
                  </div>

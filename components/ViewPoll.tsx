@@ -1,25 +1,69 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { useParams, Link } from 'react-router-dom';
-import { getPollById, addParticipantVote } from '../services/storageService';
+import { useParams, Link, useSearchParams } from 'react-router-dom';
+import { fetchPoll, addParticipantVote } from '../services/storageService';
+import { authenticateGoogle, getAccessToken } from '../services/calendarService';
 import { analyzeBestSlot } from '../services/geminiService';
 import { Poll, VoteType, Participant, Vote } from '../types';
 import Button from './Button';
 
 const ViewPoll: React.FC = () => {
   const { id } = useParams<{ id: string }>();
+  const [searchParams] = useSearchParams();
+  const bucketName = searchParams.get('bucket');
+
   const [poll, setPoll] = useState<Poll | null>(null);
   const [participantName, setParticipantName] = useState('');
   const [pendingVotes, setPendingVotes] = useState<Record<string, VoteType>>({});
   const [aiSummary, setAiSummary] = useState<string | null>(null);
+  
+  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
+  
+  const [needsAuth, setNeedsAuth] = useState(false);
+  const [clientId, setClientId] = useState(() => localStorage.getItem('google_client_id') || '');
 
   useEffect(() => {
-    if (id) {
-      const storedPoll = getPollById(id);
-      setPoll(storedPoll);
-    }
-  }, [id]);
+    const load = async () => {
+        if (!id || !bucketName) return;
+        
+        // If we don't have an access token, we can't fetch from private/CORS constrained buckets easily
+        // unless they are public. Assuming secure setup, we need auth.
+        const token = getAccessToken();
+        if (!token) {
+            setNeedsAuth(true);
+            return;
+        }
+
+        setLoading(true);
+        const data = await fetchPoll(id, bucketName);
+        if (data) {
+            setPoll(data.poll);
+        }
+        setLoading(false);
+    };
+    load();
+  }, [id, bucketName, needsAuth]); // If auth state changes, retry
+
+  const handleAuth = async () => {
+      if (!clientId) {
+          const key = prompt("Please enter the Google Client ID to connect:");
+          if (key) {
+              setClientId(key);
+              localStorage.setItem('google_client_id', key);
+          } else {
+              return;
+          }
+      } else {
+          try {
+              await authenticateGoogle(clientId);
+              setNeedsAuth(false); // Trigger reload
+          } catch (e) {
+              alert("Authentication failed.");
+          }
+      }
+  };
 
   const handleVoteChange = (slotId: string, type: VoteType) => {
     setPendingVotes(prev => {
@@ -33,27 +77,35 @@ const ViewPoll: React.FC = () => {
     });
   };
 
-  const submitVotes = () => {
-    if (!poll || !participantName.trim()) return;
+  const submitVotes = async () => {
+    if (!poll || !participantName.trim() || !bucketName) return;
+    
+    setSubmitting(true);
+    try {
+        // Convert pending votes record to array
+        const votesList: Vote[] = Object.entries(pendingVotes).map(([slotId, type]) => ({
+          slotId,
+          type: type as VoteType
+        }));
 
-    // Convert pending votes record to array
-    const votesList: Vote[] = Object.entries(pendingVotes).map(([slotId, type]) => ({
-      slotId,
-      type: type as VoteType
-    }));
+        const newParticipant: Participant = {
+          id: Date.now().toString(),
+          name: participantName,
+          votes: votesList
+        };
 
-    const newParticipant: Participant = {
-      id: Date.now().toString(),
-      name: participantName,
-      votes: votesList
-    };
-
-    const updatedPoll = addParticipantVote(poll.id, newParticipant);
-    if (updatedPoll) {
-      setPoll(updatedPoll);
-      setParticipantName('');
-      setPendingVotes({});
-      setAiSummary(null); // Reset analysis as data changed
+        const updatedPoll = await addParticipantVote(poll.id, bucketName, newParticipant);
+        if (updatedPoll) {
+          setPoll(updatedPoll);
+          setParticipantName('');
+          setPendingVotes({});
+          setAiSummary(null);
+          alert("Vote submitted!");
+        }
+    } catch (e) {
+        alert("Failed to submit vote. Someone else may have updated the poll. Please refresh.");
+    } finally {
+        setSubmitting(false);
     }
   };
 
@@ -93,11 +145,48 @@ const ViewPoll: React.FC = () => {
     return counts;
   }, [poll]);
 
+  if (!bucketName) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-white p-8 rounded-xl shadow-lg text-center max-w-md">
+                <i className="fas fa-exclamation-triangle text-4xl text-yellow-500 mb-4"></i>
+                <h2 className="text-xl font-bold text-gray-900 mb-2">Invalid Poll Link</h2>
+                <p className="text-gray-500">The storage bucket is missing from the URL.</p>
+                <Link to="/" className="text-brand-600 hover:underline mt-4 block">Go Home</Link>
+            </div>
+        </div>
+      );
+  }
+
+  if (needsAuth) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-white p-8 rounded-xl shadow-lg text-center max-w-md">
+                <i className="fas fa-lock text-4xl text-brand-600 mb-4"></i>
+                <h2 className="text-xl font-bold text-gray-900 mb-2">Login Required</h2>
+                <p className="text-gray-500 mb-6">You need to connect your Google Account to view and vote on this poll (Cloud Storage Access).</p>
+                <Button onClick={handleAuth} className="w-full justify-center">
+                    <i className="fab fa-google"></i> Connect Google
+                </Button>
+            </div>
+        </div>
+      );
+  }
+
+  if (loading) {
+      return (
+        <div className="min-h-screen flex items-center justify-center">
+            <i className="fas fa-circle-notch fa-spin text-3xl text-brand-500"></i>
+        </div>
+      );
+  }
+
   if (!poll) {
     return (
         <div className="min-h-screen flex items-center justify-center">
             <div className="text-center">
                 <h2 className="text-2xl font-bold text-gray-800">Poll not found</h2>
+                <p className="text-gray-500">Could not retrieve poll from {bucketName}</p>
                 <Link to="/" className="text-brand-600 hover:underline mt-4 block">Go Home</Link>
             </div>
         </div>
@@ -117,7 +206,7 @@ const ViewPoll: React.FC = () => {
           </div>
         </div>
         <div className="flex gap-2">
-             <Link to={`/edit/${poll.id}`}>
+             <Link to={`/edit/${poll.id}?bucket=${bucketName}`}>
                 <Button variant="secondary">
                    <i className="fas fa-pen"></i> Edit
                 </Button>
@@ -247,6 +336,7 @@ const ViewPoll: React.FC = () => {
              <Button 
                 onClick={submitVotes}
                 disabled={!participantName || Object.keys(pendingVotes).length === 0}
+                isLoading={submitting}
                 className="shadow-lg"
              >
                 Submit Vote
